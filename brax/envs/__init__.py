@@ -19,24 +19,12 @@ import functools
 from typing import Callable, Optional, Union, overload
 
 import brax
-from brax.envs import ant
-from brax.envs import fast
-from brax.envs import fetch
-from brax.envs import grasp
-from brax.envs import halfcheetah
-from brax.envs import hopper
-from brax.envs import humanoid
-from brax.envs import humanoid_standup
-from brax.envs import inverted_double_pendulum
-from brax.envs import inverted_pendulum
-from brax.envs import reacher
-from brax.envs import reacherangle
-from brax.envs import ur5e
-from brax.envs import walker2d
-from brax.envs import wrappers
-from brax.envs.env import Env, State, Wrapper
 import gym
-
+from brax.envs import (ant, antQD, fast, fetch, grasp, halfcheetah, hopper,
+                       humanoid, humanoid_standup, inverted_double_pendulum,
+                       inverted_pendulum, reacher, reacherangle, ur5e,
+                       walker2d, wrappers)
+from brax.envs.env import Env, State, Wrapper
 
 _envs = {
     'ant': ant.Ant,
@@ -53,6 +41,7 @@ _envs = {
     'reacherangle': reacherangle.ReacherAngle,
     'ur5e': ur5e.Ur5e,
     'walker2d': walker2d.Walker2d,
+    'antQD': antQD.AntQD
 }
 
 
