@@ -20,7 +20,7 @@ from brax.envs import ant, env
 
 
 class AntQD(ant.Ant):
-  """Trains an ant to run in the +x direction."""
+    """Trains an ant to run in the +x direction."""
     def _get_obs(self, qp: brax.QP, info: brax.Info) -> jp.ndarray:
         """Observe ant body position and velocities."""
         # some pre-processing to pull joint angles and velocities
