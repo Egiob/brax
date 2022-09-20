@@ -460,7 +460,8 @@ def train(
     def do_one_step(carry, unused_target_t):
         state, skill, policy_params, key = carry
         key, key_sample = jax.random.split(key)
-        obs = jnp.concatenate([state.obs, skill.squeeze()], axis=-1)
+        obs = state.obs[..., omit_obs:]
+        obs = jnp.concatenate([obs, skill.squeeze()], axis=-1)
         logits = policy_model.apply(policy_params, obs)
         actions = parametric_action_distribution.sample_no_postprocessing(
             logits, key_sample
