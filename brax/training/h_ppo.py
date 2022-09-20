@@ -216,6 +216,7 @@ def train(
     log_frequency=10,
     normalize_observations=False,
     reward_scaling=1.0,
+    omit_obs: int = 0,
     progress_fn: Optional[Callable[[int, Dict[str, Any]], None]] = None,
     checkpoint_dir: Optional[str] = None,
 ):
@@ -371,7 +372,9 @@ def train(
         key, key_sample = jax.random.split(key)
         # TODO: Make this nicer ([0] comes from pmapping).
 
-        obs = jnp.concatenate([state.obs, skill.squeeze()], axis=-1)
+        obs = state.obs[..., omit_obs:]
+
+        obs = jnp.concatenate([obs, skill.squeeze()], axis=-1)
         logits = policy_model.apply(policy_params, obs)
         actions = parametric_action_distribution.sample(logits, key_sample)
         nstate = eval_step_fn(state, actions)
