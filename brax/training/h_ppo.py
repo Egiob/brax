@@ -17,6 +17,7 @@
 See: https://arxiv.org/pdf/1707.06347.pdf
 """
 
+
 import functools
 import os
 import time
@@ -169,9 +170,7 @@ def compute_ppo_loss(
         lambda_=lambda_,
         discount=discounting,
     )
-    print(advantages.shape)
     rho_s = jnp.exp(target_action_log_probs - behaviour_action_log_probs)
-
     surrogate_loss1 = rho_s * advantages
     surrogate_loss2 = jnp.clip(rho_s, 1 - ppo_epsilon, 1 + ppo_epsilon) * advantages
 
@@ -190,13 +189,18 @@ def compute_ppo_loss(
         "policy_loss": policy_loss,
         "v_loss": v_loss,
         "entropy_loss": entropy_loss,
+        "policy_logits": policy_logits.mean(),
+        "obs_mean": data.obs.mean(),
     }
 
 
 def train(
     environment_fn: Callable[..., envs.Env],
     num_timesteps,
+    num_h_steps: int,
     episode_length: int,
+    policies_params: dict,
+    policy_model: Any,
     action_repeat: int = 1,
     num_envs: int = 1,
     max_devices_per_host: Optional[int] = None,
@@ -267,15 +271,34 @@ def train(
         event_size=core_env.action_size
     )
 
-    policy_model, value_model = networks.make_models(
-        parametric_action_distribution.param_size, core_env.observation_size
+    h_parametric_action_distribution = distribution.Categorical(event_size=1)
+
+    # h_policy_model, h_value_model = networks.make_models(
+    #     parametric_action_distribution.param_size, core_env.observation_size
+    # )
+    h_policy_model = networks.make_model(
+        [
+            32,
+            32,
+            32,
+            32,
+            5,
+        ],
+        core_env.observation_size,
+        activation=jax.nn.relu,
     )
+    h_value_model = networks.make_model(
+        [256, 256, 256, 256, 256, 1],
+        core_env.observation_size,
+        activation=jax.nn.relu,
+    )
+
     key_policy, key_value = jax.random.split(key_models)
 
     optimizer = optax.adam(learning_rate=learning_rate)
     init_params = {
-        "policy": policy_model.init(key_policy),
-        "value": value_model.init(key_value),
+        "policy": h_policy_model.init(key_policy),
+        "value": h_value_model.init(key_value),
     }
     optimizer_state = optimizer.init(init_params)
     optimizer_state, init_params = pmap.bcast_local_devices(
@@ -297,9 +320,9 @@ def train(
 
     loss_fn = functools.partial(
         compute_ppo_loss,
-        parametric_action_distribution=parametric_action_distribution,
-        policy_apply=policy_model.apply,
-        value_apply=value_model.apply,
+        parametric_action_distribution=h_parametric_action_distribution,
+        policy_apply=h_policy_model.apply,
+        value_apply=h_value_model.apply,
         entropy_cost=entropy_cost,
         discounting=discounting,
         reward_scaling=reward_scaling,
@@ -307,57 +330,58 @@ def train(
 
     grad_loss = jax.grad(loss_fn, has_aux=True)
 
-    def do_one_step_eval(carry, unused_target_t):
-        state, policy_params, normalizer_params, key = carry
-        key, key_sample = jax.random.split(key)
-        # TODO: Make this nicer ([0] comes from pmapping).
-        obs = obs_normalizer_apply_fn(
-            jax.tree_map(lambda x: x[0], normalizer_params), state.obs
-        )
-        logits = policy_model.apply(policy_params, obs)
-        actions = parametric_action_distribution.sample(logits, key_sample)
-        nstate = eval_step_fn(state, actions)
-        return (nstate, policy_params, normalizer_params, key), ()
-
     @jax.jit
     def run_eval(
         state, key, policy_params, normalizer_params
     ) -> Tuple[envs.State, PRNGKey]:
         policy_params = jax.tree_map(lambda x: x[0], policy_params)
         (state, _, _, key), _ = jax.lax.scan(
-            do_one_step_eval,
+            do_one_h_step_eval,
             (state, policy_params, normalizer_params, key),
             (),
             length=episode_length // action_repeat,
         )
         return state, key
 
-    def do_one_step(carry, unused_target_t):
-        state, normalizer_params, policy_params, key = carry
+    def do_one_h_step_eval(carry, unused_target_t):
+        state, h_policy_params, normalizer_params, key = carry
         key, key_sample = jax.random.split(key)
-        normalized_obs = obs_normalizer_apply_fn(normalizer_params, state.obs)
-        logits = policy_model.apply(policy_params, normalized_obs)
-        actions = parametric_action_distribution.sample_no_postprocessing(
-            logits, key_sample
-        )
-        postprocessed_actions = parametric_action_distribution.postprocess(actions)
-        jax.tree_map(lambda x: print(x.shape), eval_first_state)
-        print(postprocessed_actions.shape)
-        nstate = step_fn(state, postprocessed_actions)
-        return (nstate, normalizer_params, policy_params, key), StepData(
-            obs=state.obs,
-            rewards=state.reward,
-            dones=state.done,
-            truncation=state.info["truncation"],
-            actions=actions,
-            logits=logits,
+
+        obs = obs_normalizer_apply_fn(
+            jax.tree_map(lambda x: x[0], normalizer_params), state.obs
         )
 
-    def generate_unroll(carry, unused_target_t):
-        state, normalizer_params, policy_params, key = carry
+        logits = h_policy_model.apply(h_policy_params, obs)
+        actions = h_parametric_action_distribution.sample(logits, key_sample)
+        skill = jax.nn.one_hot(actions, 5)
+        policy_params = policies_params
+        key, key_generate_unroll = jax.random.split(key)
+
+        (nstate, _, _, key), _ = jax.lax.scan(
+            do_one_step_eval,
+            (state, policy_params, skill, key),
+            (),
+            length=num_h_steps,
+        )
+
+        return (nstate, h_policy_params, normalizer_params, key), ()
+
+    def do_one_step_eval(carry, unused_target_t):
+        state, policy_params, skill, key = carry
+        key, key_sample = jax.random.split(key)
+        # TODO: Make this nicer ([0] comes from pmapping).
+
+        obs = jnp.concatenate([state.obs, skill.squeeze()], axis=-1)
+        logits = policy_model.apply(policy_params, obs)
+        actions = parametric_action_distribution.sample(logits, key_sample)
+        nstate = eval_step_fn(state, actions)
+        return (nstate, policy_params, skill, key), ()
+
+    def generate_h_unroll(carry, unused_target_t):
+        state, normalizer_params, h_policy_params, key = carry
         (state, _, _, key), data = jax.lax.scan(
-            do_one_step,
-            (state, normalizer_params, policy_params, key),
+            do_one_h_step,
+            (state, normalizer_params, h_policy_params, key),
             (),
             length=unroll_length,
         )
@@ -371,7 +395,83 @@ def train(
                 [data.truncation, jnp.expand_dims(state.info["truncation"], axis=0)]
             ),
         )
-        return (state, normalizer_params, policy_params, key), data
+        return (state, normalizer_params, h_policy_params, key), data
+
+    def do_one_h_step(carry, unused_target_t):
+        state, normalizer_params, h_policy_params, key = carry
+        key, key_sample = jax.random.split(key)
+        obs = obs_normalizer_apply_fn(normalizer_params, state.obs)
+        # obs = state.obs
+        logits = h_policy_model.apply(h_policy_params, obs)
+        actions = h_parametric_action_distribution.sample_no_postprocessing(
+            logits, key_sample
+        )
+        # postprocessed_actions = h_parametric_action_distribution.postprocess(actions)
+        key, key_generate_unroll = jax.random.split(key)
+        skill = jax.nn.one_hot(actions, 5)
+        (nstate, _, _, _), data = generate_unroll(
+            (
+                state,
+                skill,
+                policies_params,
+                key_generate_unroll,
+            ),
+            None,
+        )
+
+        is_done = jnp.clip(jnp.cumsum(data.dones, axis=0), 0, 1)
+        mask = jnp.roll(is_done, 1, axis=0)
+        mask = mask.at[0, :].set(0)
+        rewards = jnp.sum(data.rewards * (1.0 - mask), axis=0)
+        dones = jnp.clip(jnp.sum(data.dones, axis=0), 0, 1)
+        truncations = jnp.clip(jnp.sum(data.truncation, axis=0), 0, 1)
+        return (nstate, normalizer_params, h_policy_params, key), StepData(
+            obs=state.obs,
+            rewards=rewards,
+            dones=dones,
+            truncation=truncations,
+            actions=actions,
+            logits=logits,
+        )
+
+    def generate_unroll(carry, unused_target_t):
+        state, skill, policy_params, key = carry
+        (state, _, _, key), data = jax.lax.scan(
+            do_one_step,
+            (state, skill, policy_params, key),
+            (),
+            length=unroll_length,
+        )
+        data = data.replace(
+            obs=jnp.concatenate([data.obs, jnp.expand_dims(state.obs, axis=0)]),
+            rewards=jnp.concatenate(
+                [data.rewards, jnp.expand_dims(state.reward, axis=0)]
+            ),
+            dones=jnp.concatenate([data.dones, jnp.expand_dims(state.done, axis=0)]),
+            truncation=jnp.concatenate(
+                [data.truncation, jnp.expand_dims(state.info["truncation"], axis=0)]
+            ),
+        )
+        return (state, skill, policy_params, key), data
+
+    def do_one_step(carry, unused_target_t):
+        state, skill, policy_params, key = carry
+        key, key_sample = jax.random.split(key)
+        obs = jnp.concatenate([state.obs, skill.squeeze()], axis=-1)
+        logits = policy_model.apply(policy_params, obs)
+        actions = parametric_action_distribution.sample_no_postprocessing(
+            logits, key_sample
+        )
+        postprocessed_actions = parametric_action_distribution.postprocess(actions)
+        nstate = step_fn(state, postprocessed_actions)
+        return (nstate, skill, policy_params, key), StepData(
+            obs=state.obs,
+            rewards=state.reward,
+            dones=state.done,
+            truncation=state.info["truncation"],
+            actions=actions,
+            logits=logits,
+        )
 
     def update_model(carry, data):
         optimizer_state, params, key = carry
@@ -412,7 +512,7 @@ def train(
             training_state.key, 3
         )
         (state, _, _, _), data = jax.lax.scan(
-            generate_unroll,
+            generate_h_unroll,
             (
                 state,
                 training_state.normalizer_params,
@@ -422,18 +522,19 @@ def train(
             (),
             length=batch_size * num_minibatches // num_envs,
         )
+        obs1 = jnp.isnan(data.obs).sum()
         # make unroll first
         data = jax.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
         data = jax.tree_map(
             lambda x: jnp.reshape(x, [x.shape[0], -1] + list(x.shape[3:])), data
         )
-
+        obs2 = jnp.isnan(data.obs).sum()
         # Update normalization params and normalize observations.
         normalizer_params = obs_normalizer_update_fn(
             training_state.normalizer_params, data.obs[:-1]
         )
         data = data.replace(obs=obs_normalizer_apply_fn(normalizer_params, data.obs))
-
+        obs3 = jnp.isnan(data.obs).sum()
         (optimizer_state, params, _, _), metrics = jax.lax.scan(
             minimize_epoch,
             (training_state.optimizer_state, training_state.params, data, key_minimize),
@@ -441,17 +542,21 @@ def train(
             length=num_update_epochs,
         )
 
-        new_training_state = TrainingState(
+        new_training_state = TrainingState(  # type: ignore
             optimizer_state=optimizer_state,
             params=params,
             normalizer_params=normalizer_params,
             key=new_key,
         )
+        metrics["obs_1"] = obs1
+        metrics["obs_2"] = obs2
+        metrics["obs_3"] = obs3
         return (new_training_state, state), metrics
 
     num_epochs = num_timesteps // (
         batch_size * unroll_length * num_minibatches * action_repeat
     )
+    print(num_epochs)
 
     def _minimize_loop(training_state, state):
         synchro = pmap.is_replicated(
@@ -470,7 +575,7 @@ def train(
 
     minimize_loop = jax.pmap(_minimize_loop, axis_name="i")
 
-    training_state = TrainingState(
+    training_state = TrainingState(  # type: ignore
         optimizer_state=optimizer_state,
         params=init_params,
         key=jnp.stack(jax.random.split(key, local_devices_to_use)),
@@ -530,6 +635,7 @@ def train(
                 ),
             )
             logging.info(metrics)
+            print(metrics)
             current_step = int(training_state.normalizer_params[0][0]) * action_repeat
             if progress_fn:
                 progress_fn(current_step, metrics)
@@ -538,10 +644,10 @@ def train(
                 normalizer_params = jax.tree_map(
                     lambda x: x[0], training_state.normalizer_params
                 )
-                policy_params = jax.tree_map(
+                h_policy_params = jax.tree_map(
                     lambda x: x[0], training_state.params["policy"]
                 )
-                params = normalizer_params, policy_params
+                params = normalizer_params, h_policy_params
                 path = os.path.join(checkpoint_dir, f"ppo_{current_step}.pkl")
                 model.save_params(path, params)
 
@@ -561,14 +667,14 @@ def train(
 
     # To undo the pmap.
     normalizer_params = jax.tree_map(lambda x: x[0], training_state.normalizer_params)
-    policy_params = jax.tree_map(lambda x: x[0], training_state.params["policy"])
+    h_policy_params = jax.tree_map(lambda x: x[0], training_state.params["policy"])
 
     logging.info("total steps: %s", normalizer_params[0] * action_repeat)
 
     inference = make_inference_fn(
         core_env.observation_size, core_env.action_size, normalize_observations
     )
-    params = normalizer_params, policy_params
+    params = normalizer_params, h_policy_params
 
     pmap.synchronize_hosts()
     return (inference, params, metrics)
@@ -587,10 +693,10 @@ def make_inference_fn(observation_size, action_size, normalize_observations):
     )
 
     def inference_fn(params, obs, key):
-        normalizer_params, policy_params = params
+        normalizer_params, h_policy_params = params
         obs = obs_normalizer_apply_fn(normalizer_params, obs)
         action = parametric_action_distribution.sample(
-            policy_model.apply(policy_params, obs), key
+            policy_model.apply(h_policy_params, obs), key
         )
         return action
 
