@@ -522,19 +522,19 @@ def train(
             (),
             length=batch_size * num_minibatches // num_envs,
         )
-        obs1 = jnp.isnan(data.obs).sum()
+
         # make unroll first
         data = jax.tree_map(lambda x: jnp.swapaxes(x, 0, 1), data)
         data = jax.tree_map(
             lambda x: jnp.reshape(x, [x.shape[0], -1] + list(x.shape[3:])), data
         )
-        obs2 = jnp.isnan(data.obs).sum()
+
         # Update normalization params and normalize observations.
         normalizer_params = obs_normalizer_update_fn(
             training_state.normalizer_params, data.obs[:-1]
         )
         data = data.replace(obs=obs_normalizer_apply_fn(normalizer_params, data.obs))
-        obs3 = jnp.isnan(data.obs).sum()
+
         (optimizer_state, params, _, _), metrics = jax.lax.scan(
             minimize_epoch,
             (training_state.optimizer_state, training_state.params, data, key_minimize),
@@ -548,9 +548,6 @@ def train(
             normalizer_params=normalizer_params,
             key=new_key,
         )
-        metrics["obs_1"] = obs1
-        metrics["obs_2"] = obs2
-        metrics["obs_3"] = obs3
         return (new_training_state, state), metrics
 
     num_epochs = num_timesteps // (
@@ -685,19 +682,27 @@ def make_inference_fn(observation_size, action_size, normalize_observations):
     _, obs_normalizer_apply_fn = normalization.make_data_and_apply_fn(
         observation_size, normalize_observations
     )
-    parametric_action_distribution = distribution.NormalTanhDistribution(
-        event_size=action_size
-    )
-    policy_model, _ = networks.make_models(
-        parametric_action_distribution.param_size, observation_size
+    h_parametric_action_distribution = distribution.Categorical(event_size=1)
+
+    h_policy_model = networks.make_model(
+        [
+            32,
+            32,
+            32,
+            32,
+            action_size,
+        ],
+        observation_size,
+        activation=jax.nn.relu,
     )
 
     def inference_fn(params, obs, key):
         normalizer_params, h_policy_params = params
         obs = obs_normalizer_apply_fn(normalizer_params, obs)
-        action = parametric_action_distribution.sample(
-            policy_model.apply(h_policy_params, obs), key
+        action = h_parametric_action_distribution.sample(
+            h_policy_model.apply(h_policy_params, obs), key
         )
+
         return action
 
     return inference_fn
