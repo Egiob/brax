@@ -199,8 +199,8 @@ def train(
     num_timesteps,
     num_h_steps: int,
     episode_length: int,
-    policies_params: dict,
-    policy_model: Any,
+    num_skills: int,
+    skill_inference_fn: Callable,
     action_repeat: int = 1,
     num_envs: int = 1,
     max_devices_per_host: Optional[int] = None,
@@ -216,7 +216,6 @@ def train(
     log_frequency=10,
     normalize_observations=False,
     reward_scaling=1.0,
-    omit_obs: int = 0,
     progress_fn: Optional[Callable[[int, Dict[str, Any]], None]] = None,
     checkpoint_dir: Optional[str] = None,
 ):
@@ -283,7 +282,7 @@ def train(
             32,
             32,
             32,
-            5,
+            num_skills,
         ],
         core_env.observation_size,
         activation=jax.nn.relu,
@@ -354,13 +353,11 @@ def train(
 
         logits = h_policy_model.apply(h_policy_params, obs)
         actions = h_parametric_action_distribution.sample(logits, key_sample)
-        skill = jax.nn.one_hot(actions, 5)
-        policy_params = policies_params
         key, key_generate_unroll = jax.random.split(key)
 
-        (nstate, _, _, key), _ = jax.lax.scan(
+        (nstate, _, key), _ = jax.lax.scan(
             do_one_step_eval,
-            (state, policy_params, skill, key),
+            (state, actions, key),
             (),
             length=num_h_steps,
         )
@@ -368,17 +365,14 @@ def train(
         return (nstate, h_policy_params, normalizer_params, key), ()
 
     def do_one_step_eval(carry, unused_target_t):
-        state, policy_params, skill, key = carry
+        state, skill, key = carry
         key, key_sample = jax.random.split(key)
-        # TODO: Make this nicer ([0] comes from pmapping).
 
-        obs = state.obs[..., omit_obs:]
-
-        obs = jnp.concatenate([obs, skill.squeeze()], axis=-1)
-        logits = policy_model.apply(policy_params, obs)
-        actions = parametric_action_distribution.sample(logits, key_sample)
+        actions = skill_inference_fn(
+            state.obs, random_key=key_sample, skill=skill, deterministic=True
+        )
         nstate = eval_step_fn(state, actions)
-        return (nstate, policy_params, skill, key), ()
+        return (nstate, skill, key), ()
 
     def generate_h_unroll(carry, unused_target_t):
         state, normalizer_params, h_policy_params, key = carry
@@ -411,17 +405,17 @@ def train(
         )
         # postprocessed_actions = h_parametric_action_distribution.postprocess(actions)
         key, key_generate_unroll = jax.random.split(key)
-        skill = jax.nn.one_hot(actions, 5)
-        (nstate, _, _, _), data = generate_unroll(
+
+        (nstate, _, _), data = generate_unroll(
             (
                 state,
-                skill,
-                policies_params,
+                actions,
                 key_generate_unroll,
             ),
             None,
         )
 
+        print(data.dones.shape)
         is_done = jnp.clip(jnp.cumsum(data.dones, axis=0), 0, 1)
         mask = jnp.roll(is_done, 1, axis=0)
         mask = mask.at[0, :].set(0)
@@ -438,12 +432,12 @@ def train(
         )
 
     def generate_unroll(carry, unused_target_t):
-        state, skill, policy_params, key = carry
-        (state, _, _, key), data = jax.lax.scan(
+        state, skill, key = carry
+        (state, _, key), data = jax.lax.scan(
             do_one_step,
-            (state, skill, policy_params, key),
+            (state, skill, key),
             (),
-            length=unroll_length,
+            length=num_h_steps,
         )
         data = data.replace(
             obs=jnp.concatenate([data.obs, jnp.expand_dims(state.obs, axis=0)]),
@@ -455,26 +449,23 @@ def train(
                 [data.truncation, jnp.expand_dims(state.info["truncation"], axis=0)]
             ),
         )
-        return (state, skill, policy_params, key), data
+        return (state, skill, key), data
 
     def do_one_step(carry, unused_target_t):
-        state, skill, policy_params, key = carry
+        state, skill, key = carry
         key, key_sample = jax.random.split(key)
-        obs = state.obs[..., omit_obs:]
-        obs = jnp.concatenate([obs, skill.squeeze()], axis=-1)
-        logits = policy_model.apply(policy_params, obs)
-        actions = parametric_action_distribution.sample_no_postprocessing(
-            logits, key_sample
+
+        actions = skill_inference_fn(
+            state.obs, random_key=key_sample, skill=skill, deterministic=False
         )
-        postprocessed_actions = parametric_action_distribution.postprocess(actions)
-        nstate = step_fn(state, postprocessed_actions)
-        return (nstate, skill, policy_params, key), StepData(
+        nstate = step_fn(state, actions)
+        return (nstate, skill, key), StepData(
             obs=state.obs,
             rewards=state.reward,
             dones=state.done,
             truncation=state.info["truncation"],
             actions=actions,
-            logits=logits,
+            logits=jnp.zeros_like(actions),
         )
 
     def update_model(carry, data):
