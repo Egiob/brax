@@ -335,13 +335,14 @@ def train(
         state, key, policy_params, normalizer_params
     ) -> Tuple[envs.State, PRNGKey]:
         policy_params = jax.tree_map(lambda x: x[0], policy_params)
-        (state, _, _, key), _ = jax.lax.scan(
+
+        (state, _, _, key), (rewards, dones) = jax.lax.scan(
             do_one_h_step_eval,
             (state, policy_params, normalizer_params, key),
             (),
-            length=episode_length // action_repeat,
+            length=episode_length // action_repeat // num_h_steps,
         )
-        return state, key
+        return state, rewards, dones, key
 
     def do_one_h_step_eval(carry, unused_target_t):
         state, h_policy_params, normalizer_params, key = carry
@@ -355,14 +356,19 @@ def train(
         actions = h_parametric_action_distribution.sample(logits, key_sample)
         key, key_generate_unroll = jax.random.split(key)
 
-        (nstate, _, key), _ = jax.lax.scan(
+        (nstate, _, key), (rewards, dones) = jax.lax.scan(
             do_one_step_eval,
             (state, actions, key),
             (),
             length=num_h_steps,
         )
+        rewards = jnp.concatenate([rewards, jnp.expand_dims(nstate.reward, axis=0)])
+        dones = jnp.concatenate([dones, jnp.expand_dims(nstate.done, axis=0)])
 
-        return (nstate, h_policy_params, normalizer_params, key), ()
+        return (nstate, h_policy_params, normalizer_params, key), (
+            rewards,
+            dones,
+        )
 
     def do_one_step_eval(carry, unused_target_t):
         state, skill, key = carry
@@ -372,7 +378,7 @@ def train(
             state.obs, random_key=key_sample, skill=skill, deterministic=True
         )
         nstate = eval_step_fn(state, actions)
-        return (nstate, skill, key), ()
+        return (nstate, skill, key), (state.reward, state.done)
 
     def generate_h_unroll(carry, unused_target_t):
         state, normalizer_params, h_policy_params, key = carry
@@ -546,7 +552,7 @@ def train(
         return (new_training_state, state), metrics
 
     num_epochs = num_timesteps // (
-        batch_size * unroll_length * num_minibatches * action_repeat
+        batch_size * unroll_length * num_minibatches * action_repeat * num_h_steps
     )
     print(num_epochs)
 
@@ -580,18 +586,32 @@ def train(
     losses = {}
     state = first_state
     metrics = {}
+    max_fitness = 0
 
     for it in range(log_frequency + 1):
         logging.info("starting iteration %s %s", it, time.time() - xt)
         t = time.time()
 
         if process_id == 0:
-            eval_state, key_debug = run_eval(
+            eval_state, rewards, dones, key_debug = run_eval(
                 eval_first_state,
                 key_debug,
                 training_state.params["policy"],
                 training_state.normalizer_params,
             )
+
+            rewards_2 = rewards[:, 1:]
+            rewards_2 = rewards_2.reshape(-1, num_eval_envs)
+            dones = dones.reshape(-1, num_eval_envs)
+            dones = jnp.zeros_like(rewards_2)
+            is_done = jnp.clip(jnp.cumsum(dones, axis=0), 0, 1)
+            mask = jnp.roll(is_done, 1, axis=0)
+            mask = mask.at[0, :].set(0)
+            returns = jnp.sum(rewards_2 * (1.0 - mask), axis=0)
+
+            max_return = jnp.max(returns)
+            max_fitness = jnp.maximum(max_fitness, max_return)
+
             eval_metrics = eval_state.info["eval_metrics"]
             eval_metrics.completed_episodes.block_until_ready()
             eval_walltime += time.time() - t
@@ -623,12 +643,20 @@ def train(
                         "speed/training_walltime": training_walltime,
                         "speed/eval_walltime": eval_walltime,
                         "speed/timestamp": training_walltime,
+                        "custom_eval/mean_return": jnp.mean(returns),
+                        "custom_eval/max_return": jnp.max(returns),
+                        "custom_eval/min_return": jnp.min(returns),
+                        "custom_eval/std_return": jnp.std(returns),
+                        "max_fitness": max_fitness,
                     }
                 ),
             )
             logging.info(metrics)
-            print(metrics)
-            current_step = int(training_state.normalizer_params[0][0]) * action_repeat
+            current_step = (
+                int(training_state.normalizer_params[0][0])
+                * action_repeat
+                * num_h_steps
+            )
             if progress_fn:
                 progress_fn(current_step, metrics)
 
@@ -653,15 +681,20 @@ def train(
         assert synchro[0], (it, training_state)
         jax.tree_map(lambda x: x.block_until_ready(), losses)
         sps = (
-            (training_state.normalizer_params[0][0] - previous_step) / (time.time() - t)
-        ) * action_repeat
+            (
+                (training_state.normalizer_params[0][0] - previous_step)
+                / (time.time() - t)
+            )
+            * action_repeat
+            * num_h_steps
+        )
         training_walltime += time.time() - t
 
     # To undo the pmap.
     normalizer_params = jax.tree_map(lambda x: x[0], training_state.normalizer_params)
     h_policy_params = jax.tree_map(lambda x: x[0], training_state.params["policy"])
 
-    logging.info("total steps: %s", normalizer_params[0] * action_repeat)
+    logging.info("total steps: %s", normalizer_params[0] * action_repeat * num_h_steps)
 
     inference = make_inference_fn(
         core_env.observation_size, core_env.action_size, normalize_observations
