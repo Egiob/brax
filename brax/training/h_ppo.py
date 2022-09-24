@@ -586,7 +586,7 @@ def train(
     losses = {}
     state = first_state
     metrics = {}
-    max_fitness = 0
+    max_fitness = -jnp.inf
 
     for it in range(log_frequency + 1):
         logging.info("starting iteration %s %s", it, time.time() - xt)
