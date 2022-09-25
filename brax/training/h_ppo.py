@@ -421,13 +421,16 @@ def train(
             None,
         )
 
-        print(data.dones.shape)
-        is_done = jnp.clip(jnp.cumsum(data.dones, axis=0), 0, 1)
+        print("rewards shape:", data.rewards.shape)
+        rewards = data.rewards[:-1]
+        dones = data.dones[:-1]
+
+        is_done = jnp.clip(jnp.cumsum(dones, axis=0), 0, 1)
         mask = jnp.roll(is_done, 1, axis=0)
         mask = mask.at[0, :].set(0)
-        rewards = jnp.sum(data.rewards * (1.0 - mask), axis=0)
-        dones = jnp.clip(jnp.sum(data.dones, axis=0), 0, 1)
-        truncations = jnp.clip(jnp.sum(data.truncation, axis=0), 0, 1)
+        rewards = jnp.sum(rewards * (1.0 - mask), axis=0)
+        dones = jnp.clip(jnp.sum(dones, axis=0), 0, 1)
+        truncations = jnp.clip(jnp.sum(data.truncation[:-1], axis=0), 0, 1)
         return (nstate, normalizer_params, h_policy_params, key), StepData(
             obs=state.obs,
             rewards=rewards,
@@ -554,7 +557,7 @@ def train(
     num_epochs = num_timesteps // (
         batch_size * unroll_length * num_minibatches * action_repeat * num_h_steps
     )
-    print(num_epochs)
+    print("Num epoches", num_epochs)
 
     def _minimize_loop(training_state, state):
         synchro = pmap.is_replicated(
@@ -602,8 +605,9 @@ def train(
 
             rewards_2 = rewards[:, 1:]
             rewards_2 = rewards_2.reshape(-1, num_eval_envs)
+            dones = dones[:, 1:]
             dones = dones.reshape(-1, num_eval_envs)
-            dones = jnp.zeros_like(rewards_2)
+
             is_done = jnp.clip(jnp.cumsum(dones, axis=0), 0, 1)
             mask = jnp.roll(is_done, 1, axis=0)
             mask = mask.at[0, :].set(0)
@@ -678,7 +682,7 @@ def train(
         previous_step = training_state.normalizer_params[0][0]
         # optimization
         (training_state, state), losses, synchro = minimize_loop(training_state, state)
-        assert synchro[0], (it, training_state)
+        assert synchro[0], "break sync"
         jax.tree_map(lambda x: x.block_until_ready(), losses)
         sps = (
             (
