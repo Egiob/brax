@@ -388,16 +388,7 @@ def train(
             (),
             length=unroll_length,
         )
-        data = data.replace(
-            obs=jnp.concatenate([data.obs, jnp.expand_dims(state.obs, axis=0)]),
-            rewards=jnp.concatenate(
-                [data.rewards, jnp.expand_dims(state.reward, axis=0)]
-            ),
-            dones=jnp.concatenate([data.dones, jnp.expand_dims(state.done, axis=0)]),
-            truncation=jnp.concatenate(
-                [data.truncation, jnp.expand_dims(state.info["truncation"], axis=0)]
-            ),
-        )
+
         return (state, normalizer_params, h_policy_params, key), data
 
     def do_one_h_step(carry, unused_target_t):
@@ -422,12 +413,13 @@ def train(
         )
 
         print("rewards shape:", data.rewards.shape)
-        rewards = data.rewards
-        dones = data.dones
+        rewards = data.rewards[:-1]
+        dones = data.dones[:-1]
 
         is_done = jnp.clip(jnp.cumsum(dones, axis=0), 0, 1)
         mask = jnp.roll(is_done, 1, axis=0)
         mask = mask.at[0, :].set(0)
+        
         rewards = jnp.sum(rewards * (1.0 - mask), axis=0)
         dones = jnp.clip(jnp.sum(dones, axis=0), 0, 1)
         truncations = jnp.clip(jnp.sum(data.truncation, axis=0), 0, 1)
