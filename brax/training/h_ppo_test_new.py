@@ -146,19 +146,19 @@ def compute_ppo_loss(
     # At this point, we have unroll length + 1 steps. The last step is only used
     # as bootstrap value, so it's removed.
 
-    # already removed at data generation time
-    # actions = actions[:-1]
-    # logits = logits[:-1]
+
+    actions = data.actions[:-1]
+    logits = data.logits[:-1]
 
     rewards = data.rewards[1:] * reward_scaling
     truncation = data.truncation[1:]
     termination = data.dones[1:] * (1 - truncation)
 
     target_action_log_probs = parametric_action_distribution.log_prob(
-        policy_logits, data.actions
+        policy_logits, actions
     )
     behaviour_action_log_probs = parametric_action_distribution.log_prob(
-        data.logits, data.actions
+        logits, actions
     )
 
     vs, advantages = compute_gae(
@@ -285,12 +285,10 @@ def train(
             num_skills,
         ],
         core_env.observation_size,
-        activation=jax.nn.relu,
     )
     h_value_model = networks.make_model(
         [256, 256, 256, 256, 256, 1],
         core_env.observation_size,
-        activation=jax.nn.relu,
     )
 
     key_policy, key_value = jax.random.split(key_models)
@@ -386,25 +384,17 @@ def train(
             do_one_h_step,
             (state, normalizer_params, h_policy_params, key),
             (),
-            length=unroll_length,
+            length=unroll_length+1,
         )
-        data = data.replace(
-            obs=jnp.concatenate([data.obs, jnp.expand_dims(state.obs, axis=0)]),
-            rewards=jnp.concatenate(
-                [data.rewards, jnp.expand_dims(state.reward, axis=0)]
-            ),
-            dones=jnp.concatenate([data.dones, jnp.expand_dims(state.done, axis=0)]),
-            truncation=jnp.concatenate(
-                [data.truncation, jnp.expand_dims(state.info["truncation"], axis=0)]
-            ),
-        )
+
+        print(data.obs.shape)
+        print(data.rewards.shape)
         return (state, normalizer_params, h_policy_params, key), data
 
     def do_one_h_step(carry, unused_target_t):
         state, normalizer_params, h_policy_params, key = carry
         key, key_sample = jax.random.split(key)
         obs = obs_normalizer_apply_fn(normalizer_params, state.obs)
-        # obs = state.obs
         logits = h_policy_model.apply(h_policy_params, obs)
         actions = h_parametric_action_distribution.sample_no_postprocessing(
             logits, key_sample
@@ -424,14 +414,17 @@ def train(
         print("rewards shape:", data.rewards.shape)
         rewards = data.rewards
         dones = data.dones
+        truncations = data.truncation
 
         is_done = jnp.clip(jnp.cumsum(dones, axis=0), 0, 1)
         mask = jnp.roll(is_done, 1, axis=0)
         mask = mask.at[0, :].set(0)
-        
         rewards = jnp.sum(rewards * (1.0 - mask), axis=0)
-        dones = jnp.clip(jnp.sum(dones, axis=0), 0, 1)
-        truncations = jnp.clip(jnp.sum(data.truncation, axis=0), 0, 1)
+
+        dones = jnp.max(dones, axis=0)
+        truncations = jnp.max(truncations, axis=0)
+
+
         return (nstate, normalizer_params, h_policy_params, key), StepData(
             obs=state.obs,
             rewards=rewards,
@@ -448,16 +441,6 @@ def train(
             (state, skill, key),
             (),
             length=num_h_steps,
-        )
-        data = data.replace(
-            obs=jnp.concatenate([data.obs, jnp.expand_dims(state.obs, axis=0)]),
-            rewards=jnp.concatenate(
-                [data.rewards, jnp.expand_dims(state.reward, axis=0)]
-            ),
-            dones=jnp.concatenate([data.dones, jnp.expand_dims(state.done, axis=0)]),
-            truncation=jnp.concatenate(
-                [data.truncation, jnp.expand_dims(state.info["truncation"], axis=0)]
-            ),
         )
         return (state, skill, key), data
 
