@@ -422,15 +422,15 @@ def train(
         )
 
         print("rewards shape:", data.rewards.shape)
-        rewards = data.rewards[:-1]
-        dones = data.dones[:-1]
+        rewards = data.rewards
+        dones = data.dones
 
         is_done = jnp.clip(jnp.cumsum(dones, axis=0), 0, 1)
         mask = jnp.roll(is_done, 1, axis=0)
         mask = mask.at[0, :].set(0)
         rewards = jnp.sum(rewards * (1.0 - mask), axis=0)
         dones = jnp.clip(jnp.sum(dones, axis=0), 0, 1)
-        truncations = jnp.clip(jnp.sum(data.truncation[:-1], axis=0), 0, 1)
+        truncations = jnp.clip(jnp.sum(data.truncation, axis=0), 0, 1)
         return (nstate, normalizer_params, h_policy_params, key), StepData(
             obs=state.obs,
             rewards=rewards,
